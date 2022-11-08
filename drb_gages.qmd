@@ -1,0 +1,999 @@
+---
+title: "DRB_gaging_data"
+format:
+  html:
+    self-contained: true
+    self-contained-math: true
+editor: visual
+execute:
+  cache: true
+  echo: true
+  warning: false
+  error: false 
+---
+
+# Delaware River Basin (DRB) Data Exploration
+
+```{r}
+library(nhdplusTools)
+library(dataRetrieval)
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(mapview)
+library(plotly)
+library(randomForest)
+library(ggpubr)
+mapviewOptions(basemaps.color.shuffle=FALSE, 
+               basemaps=c('CartoDB.Positron', 'CartoDB.DarkMatter', 'OpenStreetMap', 'Esri.WorldImagery', 'OpenTopoMap'))
+```
+
+## GETTING GEOSPATIAL DATA
+
+Finding the DRB:
+
+```{r}
+sf_use_s2(FALSE)
+
+#List of Huc8s that represent the DRB:
+drbc_ws <- st_read('data/drb_huc8_polygon.shp') %>%
+  mutate(HUC8=paste0('0',HUC8))
+
+huc8 <- get_huc8(id = drbc_ws$HUC8, t_srs=4326) %>%
+  summarize()
+
+mapview(huc8) #... looks right!
+```
+
+Grabbing NHD data and USGS stream gages within the DRB:
+
+```{r}
+#get all NHD flowlines in the DRB, and prep for traversing
+flowlines <- get_nhdplus(AOI = huc8, realization = "flowline", t_srs = 4326) %>%
+  get_tocomid(., add=TRUE) %>%
+  mutate(ID=comid, toID=tocomid) #for later... get_pathlength() oddly uses a different naming convention than what's provided 
+
+# catchments <- get_nhdplus(AOI = huc8, realization = "catchment", t_srs = 4326) 
+
+#get all NWIS (current) sites in the DRB
+# nwis <- get_nwis(AOI = huc8) %>%
+#   st_transform(4326) %>%
+#   .[huc8,] %>%
+#   mutate(site_pretty=paste0("USGS-",site_no))
+
+#mapview(catchments) + 
+# mapview(flowlines) + 
+# mapview(nwis) #... looks right!
+```
+
+Link stream gages to their associated NHD features (flowlines, catchments) using their `comid`:
+
+```{r}
+# #linking nwis to nhdplus
+# nwis_list <- nwis$site_pretty
+# 
+# nwis$comid <- NA #attempt 'get_nldi_feature()' first
+# nwis$comid_coords <- NA #if that doesn't work for all gages (not sure why this is happening?), do 'discover_nhdplus_id()'
+# 
+# #first try to get comid using nldi (verified correct comid)
+# for(i in 1:length(nwis_list)){
+#   try(nwis$comid[i] <- get_nldi_feature(list("featureSource" = "nwissite", featureID = nwis_list[i]))$comid, silent=T)
+# }
+# 
+# #ones it didn't work for (n=33). Perhaps these are new gages?
+# weirdos <- nwis %>% filter(is.na(comid))
+# 
+# #get the comid using the weirdos' coordinates instead of their gage name
+# for(i in 1:nrow(nwis)){
+#   nwis$comid_coords[i] <- discover_nhdplus_id(nwis[i,])
+# }
+# 
+# nwis <- nwis %>%
+#   mutate(comid=ifelse(is.na(comid), comid_coords, comid)) %>%
+#   select(site_no,station_nm,comid) %>%
+#   mutate(comid=as.numeric(comid)) %>%
+#   st_write('data/nwis_gages_comid.shp', delete_layer=TRUE)
+```
+
+## Networking gages
+
+Now, for every gage in the DRB, identify all other gages that are upstream or downstream of it.
+
+```{r}
+nwis <- st_read('data/nwis_gages_comid.shp')
+
+# read in the NHD as table
+nhd <- flowlines %>% as_tibble()
+
+# all UGSG gages, unnecessary columns removed for future function
+gages <- nwis %>% select(gage=site_no,comid) %>% left_join(nhd,by="comid")
+
+# all streamgages, with NHD info linked to them
+drb_gages <- nwis %>%
+  left_join(nhd,by="comid") %>%
+  filter(!is.na(id)) %>% #for sites that oddly do not have an associated NHD flowline... need to look into why this is...
+  distinct(station_nm,.keep_all=TRUE)
+
+# function that, for every gages, lists other USGS gages up- or downstream of it. 
+gages_in_network <- function(network_union){
+  
+  tracer <- function(locations){
+    
+    gages <- as_tibble(gages)
+    
+    outlet <- drb_gages %>%
+      dplyr::filter(station_nm == locations)
+    
+    upstream_nhd <- get_UT(nhd, outlet$comid) %>% 
+      as_tibble() %>%
+      rename(comid = value)
+    
+    downstream_nhd <- get_DM(nhd, outlet$comid) %>%
+      as_tibble() %>%
+      rename (comid = value)
+    
+    rbind(upstream_nhd,downstream_nhd) %>%
+      distinct(comid,.keep_all=TRUE) %>%
+      inner_join(.,gages,by='comid') %>%
+      select(gage)}
+  
+  crawler <- map_dfr(network_union, tracer)
+ 
+}
+
+networked_gages <- drb_gages %>%
+  mutate(gages = map(station_nm, gages_in_network))
+
+#list of all gages and the gages they are related to:
+gages_related <- unnest(networked_gages,cols=gages) %>% select(site_no,comid,gage) %>%
+  st_drop_geometry() %>%
+  inner_join(select(st_drop_geometry(gages),gage, comid),by='gage') %>%
+  rename(site_1=site_no,
+        comid_1=comid.x,
+        site_2=gage,
+         comid_2=comid.y) %>%
+  mutate(combo1=paste0(site_1,'-',site_2),
+         combo2=paste0(site_2,'-',site_1)) %>%
+  select(combo1,combo2)
+```
+
+Getting distance (great circle) between all points
+
+```{r}
+gc_dist <- function(union){
+  
+  distancer <- function(locations){
+    
+    gage <- filter(nwis, site_no==locations)
+    
+    dist_matrix <- sf::st_distance(gage,nwis) %>% #great circle best for geodetic coordinates (like WGS 84)
+      as_tibble() %>%
+      pivot_longer(col=1:ncol(.)) %>%
+      cbind(nwis$site_no) %>%
+      mutate(site_1=gage$site_no) %>%
+      select(site_1,
+             site_2=3,
+             dist_m=value)}
+  
+  mapper <- map_dfr(union,distancer)
+}
+
+gc_list <- nwis %>%
+  mutate(distances = map(site_no, gc_dist)) %>%
+  unnest(., cols=distances) %>%
+  st_drop_geometry() %>%
+  select(site_1, site_2, dist_m) %>%
+  mutate(combo1=paste0(site_1,'-',site_2),
+         combo2=paste0(site_2,'-',site_1))
+```
+
+Now that we have a list of gages related to each other, we can get the distance between them using `get_pathlength()`
+
+```{r}
+#subset nhd data associated with our gages
+sub_nhd <- flowlines %>%
+  filter(ID %in% nwis$comid)
+
+path_lengths <- get_path_lengths(sub_nhd$comid, network=flowlines) %>%
+  mutate(comid1 = as.numeric(ID_1), comid2 = as.numeric(ID_2)) %>%
+  left_join(select(drb_gages, site_no, station_nm, comid, totdasqkm, streamorde), by = c("comid1"="comid")) %>%
+  rename(site_1=site_no,
+         name_1=station_nm,
+         totdasqkm_1=totdasqkm,
+         streamorde_1=streamorde) %>%
+  left_join(select(drb_gages, site_no, station_nm, comid, totdasqkm, streamorde), by = c("comid2"="comid")) %>%
+  rename(site_2=site_no,
+         name_2=station_nm,
+         totdasqkm_2=totdasqkm,
+         streamorde_2=streamorde) %>%
+  select(site_1,site_2,name_1,name_2,totdasqkm_1,totdasqkm_2,streamorde_1,streamorde_2,network_distance_km) %>%
+  mutate(combos=paste0(site_1,'-',site_2)) %>%
+  left_join(select(gc_list,combo1,dist_m),by=c("combos"="combo1")) %>%
+  left_join(select(gc_list,combo2,dist_m),by=c("combos"="combo2")) %>%
+  distinct(.keep_all=TRUE) %>%
+  mutate(distance_km=dist_m.x/1000) %>%
+  select(site_1,site_2,name_1,name_2,totdasqkm_1,totdasqkm_2,streamorde_1,streamorde_2,network_distance_km,distance_km,combos)
+```
+
+## DOWLOADING FLOW AND TEMP DATA
+
+What data is available at these gages? Data can be pulled from NWIS as daily (dv), continuous (uv), and as instantaneous (usually saved for water quality samples, qw). We want to ensure that we are collecting all the data that we can, so we are pulling data across all three methods while also minimizing the chance for redundant data.
+
+```{r}
+tables <- rvest::read_html('https://help.waterdata.usgs.gov/parameter_cd?group_cd=%') %>%
+    rvest::html_nodes('table') %>%
+    rvest::html_table()
+  
+pcodes <- tables[[1]] %>%
+    janitor::clean_names() %>%
+    dplyr::mutate(parm_cd=stringr::str_pad(as.character(parameter_code),5,pad="0"))
+
+inventory <- whatNWISdata(siteNumber = nwis$site_no) %>%
+  dplyr::left_join(pcodes,by="parm_cd") %>%
+  dplyr::filter(grepl("discharge|flow|temperature, water|water temperature",
+                      parameter_name_description, ignore.case=T),
+                # for a sediment-related parameter that still passed through
+                !grepl('sediment',parameter_name_description, ignore.case = T)) %>%
+  mutate(combo=paste0(site_no,"-",parm_cd))
+
+rm(tables,pcodes)  
+
+# DAILY
+
+daily <- inventory %>%
+  filter(data_type_cd=="dv")
+
+# list <- unique(daily$combo)
+# 
+# nwis_puller <- function(list){
+# 
+#   ind <- filter(daily, combo==list)
+# 
+#   readNWISdv(unique(ind$site_no), unique(ind$parm_cd),
+#              startDate="2009-10-01", endDate="2022-09-30") %>%
+#     write_csv(
+#       paste0('data/nwis/dv/',unique(ind$site_no),'_',unique(ind$parm_cd),'.csv'))
+# }
+# 
+# map(list,
+#     possibly(nwis_puller, otherwise=1+1))
+
+nwis_dv <- plyr::ldply(list.files(path="data/nwis/dv/",
+                                  pattern="*.csv",
+                                  full.names=TRUE),
+                       read_csv)
+
+# CONTINUOUS
+
+uv <- inventory %>%
+  filter(data_type_cd == "uv") %>%
+  # remove sites that already have daily data available for the given 
+  # parameter, site, and date range
+  filter(!combo %in% daily$combo) %>% 
+  distinct(combo,.keep_all=TRUE)
+
+# list <- unique(uv$combo)
+# 
+# nwis_puller <- function(list){
+# 
+#   ind <- filter(uv, combo==list)
+# 
+#   readNWISuv(unique(ind$site_no), unique(ind$parm_cd),
+#              startDate="2009-10-01", endDate="2022-09-30") %>%
+#     write_csv(
+#       paste0('data/nwis/uv/',unique(ind$site_no),'_',unique(ind$parm_cd),'.csv'))
+# }
+# 
+# map(list,
+#     possibly(nwis_puller, otherwise=1+1))
+
+nwis_uv <- plyr::ldply(list.files(path="data/nwis/uv/",
+                                  pattern="*.csv",
+                                  full.names=TRUE),
+                       read_csv)
+
+# for data that is stored as water quality data... very rare for continuous data
+ # qw <- inventory %>%
+ #   filter(data_type_cd=="qw") %>%
+ #   filter(!combo %in% daily$combo) %>%
+ #   filter(!combo %in% uv$combo) %>%
+ #   distinct(combo,.keep_all=TRUE)
+ # 
+ # list <- unique(qw$combo)
+ # 
+ # nwis_puller <- function(list){
+ # 
+ #   ind <- filter(qw, combo==list)
+ #   readNWISqw(unique(ind$site_no), unique(ind$parm_cd), 
+ #              startDate="2010-10-01", endDate="2022-09-30") %>%
+ #     write_csv(
+ #       paste0('data/nwis/qw/',unique(ind$site_no),'_',unique(ind$parm_cd),'.csv'))
+ # }
+ # 
+ # map(list,
+ #     possibly(nwis_puller, otherwise=1+1))
+ # 
+ # nwis_qw <- plyr::ldply(list.files(path="data/nwis/qw/", 
+ #                                   pattern="*.csv", 
+ #                                   full.names=TRUE),
+ #                        read_csv)
+```
+
+Organizing this mess of slightly different parameter names that makes working with the dataset difficult.
+
+```{r}
+daily <- nwis_dv %>%
+  # Preserve NGWOS data if available
+  mutate(X_00060_00003=ifelse(!is.na(X_.NGWOS._00060_00003), 
+                              X_.NGWOS._00060_00003, X_00060_00003)) %>%
+  mutate(X_00010_00003=ifelse(!is.na(X_.NGWOS._00010_00003),
+                              X_.NGWOS._00010_00003, X_00010_00003)) %>%
+  mutate(NGWOS=ifelse(!is.na(X_.NGWOS._00060_00003)|!is.na(X_.NGWOS._00010_00003),
+                      "NGWOS", NA)) %>%
+  # columns that represent sites with multiple values for a given parameter
+  select(!contains(c("_cd",
+                     "Test.Bed",
+                     "Piezometer",
+                     "EXPERIMENTAL",
+                     "NGWOS"))) %>%
+  pivot_longer(contains("X_00060_00003"), 
+               names_to="DISCHARGE", values_to="CFS") %>%
+  pivot_longer(contains("72137_00003"), 
+               names_to="TIDAL_DISCHARGE", values_to="TIDAL_CFS") %>%
+  pivot_longer(contains("00010_00003"), 
+               names_to="TEMP", values_to="CELSIUS") %>%
+  # if there is no data in any of these columns, remove... essentially, 
+  # removing those instances where there was no "normal" data, only
+  # "experimental" data
+  filter(!is.na(CFS) | !is.na(TIDAL_CFS) | !is.na(CELSIUS))
+
+# Any data loss after this manipulation?
+n_distinct(daily$site_no)==n_distinct(nwis_dv$site_no) #...No! yay
+
+continuous <- nwis_uv %>%
+  mutate(dateTime=as_datetime(dateTime, tz="UTC")) %>%
+  mutate(DT = with_tz(dateTime, tzone = "EST"),
+         Date = as_date(DT)) %>%
+  group_by(site_no,Date) %>%
+  summarize(CELSIUS=mean(X_00010_00000,na.rm=T),
+            CFS=mean(X_00060_00000,na.rm=T),
+            FS=mean(X_72255_00000,na.rm=T),
+            TIDAL_CFS=mean(X_72137_00000,na.rm=T)) %>%
+   filter(!is.na(CFS) | !is.na(TIDAL_CFS) | !is.na(CELSIUS))
+
+# Any data loss after this manipulation?
+n_distinct(nwis_uv$site_no)==n_distinct(continuous$site_no) #...No! yay
+```
+
+Separating our now-tidied data into flow and temperature:
+
+```{r}
+temperature <- select(daily,site_no,Date,CELSIUS) %>%
+  rbind(distinct(select(continuous,site_no,Date,CELSIUS), .keep_all=TRUE)) %>%
+  filter(!is.na(CELSIUS)|CELSIUS<=-333)
+
+# test that there are no duplicates (indicating something funky is going on)
+temperature %>% group_by(site_no,Date) %>% summarize(count=n()) %>% filter(count>1) 
+
+
+discharge <- select(daily,site_no,Date,CFS) %>%
+  distinct(.keep_all=TRUE) %>%
+  rbind(distinct(select(continuous,site_no,Date,CFS), .keep_all=TRUE)) %>%
+  filter(!is.na(CFS)) %>%
+  filter(CFS>-999999.000)
+
+# test that there are no duplicates (indicating something funky is going on)
+discharge %>% group_by(site_no,Date) %>% summarize(count=n()) %>% filter(count>1) %>% distinct(site_no,.keep_all=TRUE)
+
+
+tidal_discharge <- select(daily,site_no,Date,TIDAL_CFS) %>%
+  distinct(.keep_all=TRUE) %>%
+  rbind(distinct(select(continuous,site_no,Date,TIDAL_CFS), .keep_all=TRUE)) %>%
+  filter(!is.na(TIDAL_CFS))
+
+# test that there are no duplicates (indicating something funky is going on)
+tidal_discharge %>% group_by(site_no,Date) %>% summarize(count=n()) %>% filter(count>1) %>% distinct(site_no,.keep_all=TRUE)
+```
+
+## DATA AVAILABILITY BY HUC-6
+
+Heatmap plots showing when and where temp/discharge data is available. (Split by Huc-6, essentially lower/upper.)
+
+```{r}
+huc6 <- get_huc8(id = drbc_ws$HUC8, t_srs=4326) %>%
+  mutate(huc6 = paste0('HUC-',str_sub(huc8,end = 6))) %>%
+  group_by(huc6) %>%
+  summarize()
+
+mapview(huc6) + mapview(nwis, col.regions="black",alpha=0.1, layer.name="All NWIS", cex=3) 
+
+hm_t <- nwis %>%
+  inner_join(padr::pad(temperature,group="site_no"), by='site_no') %>%
+  st_join(huc6,left=T)
+
+hm_d <- nwis %>%
+  inner_join(padr::pad(discharge,group="site_no"), by='site_no') %>%
+  st_join(huc6,left=T) %>%
+  group_by(site_no) 
+
+hm_td <- nwis %>%
+  inner_join(padr::pad(tidal_discharge,group="site_no"), by='site_no') %>%
+  st_join(huc6,left=T) %>%
+  group_by(site_no) 
+  
+ggplot(filter(hm_t,huc6=="HUC-020401"),aes(x=Date,y=site_no,fill=CELSIUS))+
+  geom_tile() +
+  theme(axis.text.x = element_text(angle = 0)) +
+  theme_classic()+
+  scico::scale_fill_scico(palette = "lajolla", na.value='white') +
+  theme(#remove x axis labels
+         #remove x axis ticks
+        #axis.text.y=element_blank(),  #remove y axis labels
+        axis.ticks.y=element_blank(),  #remove y axis ticks
+        panel.background = element_blank(),
+        text=element_text(size=7)) +
+  ggtitle("HUC-020401: Upper Watershed")
+ggsave('temp_upper.jpg')
+
+ggplot(filter(hm_t,huc6=="HUC-020402"),aes(x=Date,y=site_no,fill=CELSIUS))+
+  geom_tile() +
+  theme(axis.text.x = element_text(angle = 0)) +
+  theme_classic()+
+  scico::scale_fill_scico(palette = "lajolla", na.value='white') +
+  theme(#remove x axis labels
+         #remove x axis ticks
+        #axis.text.y=element_blank(),  #remove y axis labels
+        axis.ticks.y=element_blank(),  #remove y axis ticks
+        panel.background = element_blank(),
+        text=element_text(size=7)) +
+  ggtitle("HUC-020402: Lower Watershed")
+ggsave('temp_lower.jpg')
+
+ggplot(filter(hm_d,huc6=="HUC-020401"),aes(x=Date,y=site_no))+
+  geom_tile() +
+  theme(axis.text.x = element_text(angle = 0)) +
+  theme_classic()+
+  scico::scale_fill_scico(palette = "vik", na.value='white') +
+  theme(#remove x axis labels
+         #remove x axis ticks
+        #axis.text.y=element_blank(),  #remove y axis labels
+        axis.ticks.y=element_blank(),  #remove y axis ticks
+        panel.background = element_blank(),
+        text=element_text(size=7)) +
+  ggtitle("HUC-020401: Upper Watershed")
+ggsave('discharge_upper.jpg')
+
+ggplot(filter(hm_d,huc6=="HUC-020402"),aes(x=Date,y=site_no))+
+  geom_tile() +
+  theme(axis.text.x = element_text(angle = 0)) +
+  theme_classic()+
+  scico::scale_fill_scico(palette = "vik", na.value='white') +
+  theme(#remove x axis labels
+         #remove x axis ticks
+        #axis.text.y=element_blank(),  #remove y axis labels
+        axis.ticks.y=element_blank(),  #remove y axis ticks
+        panel.background = element_blank(),
+        text=element_text(size=7)) +
+  ggtitle("HUC-020402: Lower Watershed")
+ggsave('discharge_lower.jpg')
+
+ggplot(filter(hm_td,huc6=="HUC-020401"),aes(x=Date,y=site_no))+
+  geom_tile() +
+  theme(axis.text.x = element_text(angle = 0)) +
+  theme_classic()+
+  scico::scale_fill_scico(palette = "vik", na.value='white') +
+  theme(#remove x axis labels
+         #remove x axis ticks
+        #axis.text.y=element_blank(),  #remove y axis labels
+        axis.ticks.y=element_blank(),  #remove y axis ticks
+        panel.background = element_blank(),
+        text=element_text(size=7)) +
+  ggtitle("HUC-020401: Upper Watershed")
+ggsave('t_discharge_upper.jpg')
+
+ggplot(filter(hm_td,huc6=="HUC-020402"),aes(x=Date,y=site_no))+
+  geom_tile() +
+  theme(axis.text.x = element_text(angle = 0)) +
+  theme_classic()+
+  scico::scale_fill_scico(palette = "vik", na.value='white') +
+  theme(#remove x axis labels
+         #remove x axis ticks
+        #axis.text.y=element_blank(),  #remove y axis labels
+        axis.ticks.y=element_blank(),  #remove y axis ticks
+        panel.background = element_blank(),
+        text=element_text(size=7)) +
+  ggtitle("HUC-020402: Lower Watershed")
+ggsave('t_discharge_lower.jpg')
+```
+
+For future analysis, I have decided to use sites that have data from the last 3 years (2020-2022 water years). Moreover, every year must have less than 19 days of missing data (roughly 5%).
+
+```{r}
+date_range <- 2020
+dif <- 2022-date_range+1
+# <- SELECT HOW FAR BACK WE WANT TO GO ERE
+
+temperature <- temperature %>%
+  dplyr::mutate(month=month(Date)) %>% 
+  dplyr::mutate(year=year(Date)) %>%
+  dplyr::mutate(wyear=as.numeric(ifelse(month>9, year+1, year))) %>%
+  filter(wyear >= date_range) %>%
+  dplyr::group_by(site_no, wyear) %>%
+  mutate(n = n()) %>%
+  filter(n>=19) %>%
+  group_by(site_no) %>%
+  mutate(n = n_distinct(wyear)) %>%
+  filter(n==dif) %>%
+  select(-wyear,n)
+
+# test: do these numbers look right based on heat maps?
+n_distinct(hm_t$site_no) - n_distinct(temperature$site_no)
+
+
+discharge <- discharge %>%
+  dplyr::mutate(month=month(Date)) %>% 
+  dplyr::mutate(year=year(Date)) %>%
+  dplyr::mutate(wyear=as.numeric(ifelse(month>9, year+1, year))) %>%
+  filter(wyear >= date_range) %>%
+  dplyr::group_by(site_no, wyear) %>%
+  mutate(n = n()) %>%
+  filter(n>=19) %>%
+  group_by(site_no) %>%
+  mutate(n = n_distinct(wyear)) %>%
+  filter(n==dif) %>%
+  select(-wyear,n)
+
+# test: do these numbers look right based on heat maps?
+n_distinct(hm_d$site_no) - n_distinct(discharge$site_no)
+
+tidal_discharge <- tidal_discharge %>%
+  dplyr::mutate(month=month(Date)) %>% 
+  dplyr::mutate(year=year(Date)) %>%
+  dplyr::mutate(wyear=as.numeric(ifelse(month>9, year+1, year))) %>%
+  filter(wyear >= date_range) %>%
+  dplyr::group_by(site_no, wyear) %>%
+  mutate(n = n()) %>%
+  filter(n>=19) %>%
+  group_by(site_no) %>%
+  mutate(n = n_distinct(wyear)) %>%
+  filter(n==dif) %>%
+  select(-wyear,n)
+
+# test: doe these number look right based on heat maps?
+n_distinct(hm_td$site_no) - n_distinct(tidal_discharge$site_no)
+
+discharge <- rbind(discharge,rename(tidal_discharge, CFS=TIDAL_CFS))
+
+
+sites_w_discharge <- nwis %>%
+  filter(site_no %in% discharge$site_no)
+
+sites_w_tidal_discharge <- nwis %>%
+  filter(site_no %in% tidal_discharge$site_no)
+
+sites_w_temp <- nwis %>%
+  filter(site_no %in% temperature$site_no)
+
+mapview(nwis, col.regions="black",alpha=0.1, layer.name="None", cex=3) +
+  mapview(sites_w_discharge,col.regions="light blue",cex=7.5, alpha.regions=1, layer.name="Discharge") +
+  #mapview(sites_w_tidal_discharge,col.regions="blue", alpha.regions=1, cex=6, layer.name="Tidal Discharge")+
+  mapview(sites_w_temp,col.regions="red", alpha.regions=1, cex=4, layer.name= "Water Temperature")
+```
+
+## EXPLORING "RELATEDNESS" OF STREAM GAGE DISCHARGE AND TEMPERATURE
+
+### Discharge
+
+Get the NSE and PBIAS for each gage and all of its related gages' discharge time series data (2020 through current (2022) water year, daily mean).
+
+(For a gage to be a sufficient predictor the relationship should have an NSE \> 0.5, an RSR \> 0.5, and a PBIAS \< 25.)
+
+```{r}
+flow_stats_all <- path_lengths %>%
+  select(-combos) %>%
+  inner_join(select(discharge, Date, site_no, CFS), by = c("site_1"="site_no")) %>%
+  rename(cfs_1=CFS) %>%
+  mutate(Date=ymd(Date),
+         distance_km=as.numeric(str_replace_all(distance_km," [m]",""))) %>%
+  padr::pad(., group='site_1') %>% #to make sure all dates are actually accounted for, even when there was no data.
+  #filter(Date>="2020-10-01") %>%
+  inner_join(select(discharge, Date, site_no, CFS), by = c("site_2"="site_no", "Date")) %>%
+  rename(cfs_2=CFS) %>%
+  dplyr::group_by(site_1,site_2,name_1,name_2,totdasqkm_1,totdasqkm_2,streamorde_1,streamorde_2,network_distance_km,distance_km) %>%
+  mutate(mm_day_1=1000*(cfs_1*0.028316847000000252*86400)/(totdasqkm_1*1000000),
+         mm_day_2=1000*(cfs_2*0.028316847000000252*86400)/(totdasqkm_2*1000000)) %>%
+  summarize(NSE_mm_day=ifelse(totdasqkm_1>totdasqkm_2, hydroGOF::NSE(mm_day_1,mm_day_2,na.rm=TRUE), hydroGOF::NSE(mm_day_2,mm_day_1,na.rm=TRUE)),
+            RSR_mm_day=ifelse(totdasqkm_1>totdasqkm_2, hydroGOF::rsr(mm_day_1,mm_day_2,na.rm=TRUE), hydroGOF::rsr(mm_day_2,mm_day_1,na.rm=TRUE)),
+            PBIAS_mm_day=ifelse(totdasqkm_1>totdasqkm_2, hydroGOF::pbias(mm_day_1,mm_day_2,na.rm=TRUE), hydroGOF::pbias(mm_day_2,mm_day_1,na.rm=TRUE))) %>%
+  distinct(.keep_all=TRUE) %>%
+  mutate(NSE_mm_day_pos=ifelse(NSE_mm_day<0,0,NSE_mm_day)) %>%
+  mutate(pb=case_when(PBIAS_mm_day>25~"> 25%",
+                      PBIAS_mm_day<=25&PBIAS_mm_day>15~"15% - 25%",
+                      PBIAS_mm_day<=15&PBIAS_mm_day>10~"10% - 15%",
+                      PBIAS_mm_day<=10&PBIAS_mm_day>=0~"< 10%",
+                      PBIAS_mm_day<0~"Underestimation"))
+
+flow_stats <- path_lengths %>%
+  # Removing locations that are not hydrologically "connected" to one another
+  filter(combos %in% c(gages_related$combo1,gages_related$combo2)) %>%
+  select(-combos) %>%
+  inner_join(select(discharge, Date, site_no, CFS), by = c("site_1"="site_no")) %>%
+  rename(cfs_1=CFS) %>%
+  dplyr::mutate(Date=ymd(Date),
+               distance_km=as.numeric(str_replace_all(distance_km," [m]",""))) %>%
+  padr::pad(., group='site_1') %>% #to make sure all dates are actually accounted for, even when there was no data.
+  #filter(Date>="2020-10-01") %>%
+  inner_join(select(discharge, Date, site_no, CFS), by = c("site_2"="site_no", "Date")) %>%
+  rename(cfs_2=CFS) %>%
+  dplyr::group_by(site_1,site_2,name_1,name_2,totdasqkm_1,totdasqkm_2,streamorde_1,streamorde_2,network_distance_km,distance_km) %>%
+  mutate(mm_day_1=1000*(cfs_1*0.028316847000000252*86400)/(totdasqkm_1*1000000),
+         mm_day_2=1000*(cfs_2*0.028316847000000252*86400)/(totdasqkm_2*1000000)) %>%
+  summarize(NSE_mm_day=ifelse(totdasqkm_1>totdasqkm_2, hydroGOF::NSE(mm_day_1,mm_day_2,na.rm=TRUE), hydroGOF::NSE(mm_day_2,mm_day_1,na.rm=TRUE)),
+            RSR_mm_day=ifelse(totdasqkm_1>totdasqkm_2, hydroGOF::rsr(mm_day_1,mm_day_2,na.rm=TRUE), hydroGOF::rsr(mm_day_2,mm_day_1,na.rm=TRUE)),
+            PBIAS_mm_day=ifelse(totdasqkm_1>totdasqkm_2, hydroGOF::pbias(mm_day_1,mm_day_2,na.rm=TRUE), hydroGOF::pbias(mm_day_2,mm_day_1,na.rm=TRUE))) %>%
+  distinct(.keep_all=TRUE) %>%
+  mutate(NSE_mm_day_pos=ifelse(NSE_mm_day<0,0,NSE_mm_day)) %>%
+  mutate(pb=case_when(PBIAS_mm_day>25~"> 25%",
+                      PBIAS_mm_day<=25&PBIAS_mm_day>15~"15% - 25%",
+                      PBIAS_mm_day<=15&PBIAS_mm_day>10~"10% - 15%",
+                      PBIAS_mm_day<=10&PBIAS_mm_day>=0~"< 10%",
+                      PBIAS_mm_day<0~"Underestimation"))
+```
+
+Plot displaying the DAILY FLOW NSE and PBIAS for every "related" gage's combination as it relates to their distance apart.
+
+```{r}
+flow_stat_prop <- flow_stats_all %>%
+  mutate(length_prop=log10(distance_km/network_distance_km),
+         prop=ifelse(length_prop <= -1.0, "< -1", "> -1"))
+
+one <- ggplot(data=flow_stat_prop)+
+    geom_point(aes(x=network_distance_km,y=(NSE_mm_day_pos))) +
+    theme_bw() +
+    xlab("Stream Network Distance (km)")+
+    ylab("NSE of mean daily flow (mm/day)")
+
+
+two <- ggplot(data=flow_stat_prop)+
+    geom_point(aes(x=distance_km,y=(NSE_mm_day_pos))) +
+    theme_bw() +
+  xlab("Euclidean Distance (km)")+
+  ylab("NSE of mean daily flow (mm/day)")
+
+ggarrange(one,two)
+
+ggplot(data=flow_stat_prop)+
+  geom_point(aes(x=length_prop,y=(NSE_mm_day_pos),color=network_distance_km)) +
+  theme_bw() +
+  xlab("log(Euclidean:Network Distances)")+
+  ylab("NSE of mean daily flow (mm/day)") +
+  scale_color_gradient2(name="Network Distance",low="#56B4E9", mid="#F0E442", high="#D55E00", guide="colourbar", midpoint=350, limits=c(0,700))
+
+ggplot(data=filter(flow_stat_prop,length_prop<100)) +
+    geom_point(aes(x=network_distance_km,y=(NSE_mm_day_pos),color=(prop)),size=2.5) +
+    theme_bw() +
+    xlab("Stream Network Distance (km)")+
+    ylab("NSE of mean daily flow (mm/day)") +
+  scale_color_manual(name="log(Euclidean:Network Distances)", values=c("red","grey"))
+```
+
+Map showing a gage-specific version of the same data:
+
+```{r}
+single <- flow_stats %>%
+  filter(site_1=='01434000'|site_2=='01434000') %>%
+  mutate(station=ifelse(name_1=="DELAWARE RIVER AT PORT JERVIS NY", name_2, name_1),
+         site_no=ifelse(name_1=="DELAWARE RIVER AT PORT JERVIS NY", site_2, site_1))
+
+single_gage_network <- nwis %>%
+  filter(site_no %in% single$site_no) %>%
+  left_join(single, by="site_no")
+
+mapview(filter(nwis, site_no=="01434000"), col.region="black", cex=8, layer.name="Gage of Interest", alpha.region=1) + mapview(single_gage_network, zcol='NSE_mm_day_pos', na.rm=T, layer.name="Related Gages (Discharge)")
+```
+
+### Water Temperature
+
+Get the NSE and PBIAS for each gage and all of its related gages' temperature time series data (2018 through current (2022) water year, daily mean).
+
+(For a gage to be a sufficient predictor the relationship should have an NSE \>0.5, an RSR \> 0.5, and a PBIAS \< 25.)
+
+```{r}
+# temperature_stats <- path_lengths %>%
+#   inner_join(select(temperature, c(Date, site_no, CELSIUS)), by = c("site_1"="site_no")) %>%
+#   rename(temp_1=CELSIUS) %>%
+#   mutate(Date=ymd(Date)) %>%
+#   padr::pad(., group='site_1') %>% #to make sure all dates are actually accounted for, even when there was no data.
+#   #filter(Date>="2020-10-01") %>%
+#   inner_join(select(temperature, Date, site_no, CELSIUS), by = c("site_2"="site_no", "Date")) %>%
+#   rename(temp_2=CELSIUS) %>%
+#   dplyr::group_by(site_1,site_2,name_1,name_2,totdasqkm_1,totdasqkm_2,streamorde_1,streamorde_2,network_distance_km) %>%
+#   mutate(norm_1=(temp_1-min(temp_1))/(max(temp_1)-min(temp_1)),
+#          norm_2=(temp_2-min(temp_2))/(max(temp_2)-min(temp_2))) %>%
+#   summarize(NSE_norm=ifelse(totdasqkm_1>totdasqkm_2, hydroGOF::NSE(norm_1,norm_2,na.rm=TRUE), hydroGOF::NSE(norm_2,norm_1,na.rm=TRUE)),
+#             RSR_norm=ifelse(totdasqkm_1>totdasqkm_2, hydroGOF::rsr(norm_1,norm_2,na.rm=TRUE), hydroGOF::rsr(norm_2,norm_1,na.rm=TRUE)),
+#             PBIAS_norm=ifelse(totdasqkm_1>totdasqkm_2, hydroGOF::pbias(norm_1,norm_2,na.rm=TRUE), hydroGOF::pbias(norm_2,norm_1,na.rm=TRUE)),
+#             NSE=ifelse(totdasqkm_1>totdasqkm_2, hydroGOF::NSE(temp_1,temp_2,na.rm=TRUE), hydroGOF::NSE(temp_2,temp_1,na.rm=TRUE)),
+#             RSR=ifelse(totdasqkm_1>totdasqkm_2, hydroGOF::rsr(temp_1,temp_2,na.rm=TRUE), hydroGOF::rsr(temp_2,temp_1,na.rm=TRUE)),
+#             PBIAS=ifelse(totdasqkm_1>totdasqkm_2, hydroGOF::pbias(temp_1,temp_2,na.rm=TRUE), hydroGOF::pbias(temp_2,temp_1,na.rm=TRUE))) %>%
+#   distinct(.keep_all=TRUE) %>%
+#   mutate(NSE_norm_pos=ifelse(NSE_norm<0,0,NSE_norm)) %>%
+#   mutate(NSE_pos=ifelse(NSE<0,0,NSE)) %>%
+#   mutate(pb_norm=case_when(PBIAS_norm>25~"> 25%",
+#                       PBIAS_norm<=25&PBIAS_norm>15~"15% - 25%",
+#                       PBIAS_norm<=15&PBIAS_norm>10~"10% - 15%",
+#                       PBIAS_norm<=10&PBIAS_norm>=0~"< 10%",
+#                       PBIAS_norm<0~"Underestimation")) %>%
+#   mutate(pb=case_when(PBIAS>25~"> 25%",
+#                       PBIAS<=25&PBIAS>15~"15% - 25%",
+#                       PBIAS<=15&PBIAS>10~"10% - 15%",
+#                       PBIAS<=10&PBIAS>=0~"< 10%",
+#                       PBIAS<0~"Underestimation"))
+```
+
+Plot displaying the DAILY TEMPERATURE NSE and PBIAS for every "related" gage's combination as it relates to their distance apart.
+
+```{r}
+# ggplot(data=temperature_stats)+
+#     geom_point(aes(x=network_distance_km,y=(NSE_pos), color=pb)) +
+#     theme_bw()
+# 
+# #Max-Min Normalized
+# ggplot(data=temperature_stats)+
+#     geom_point(aes(x=network_distance_km,y=(NSE_norm_pos), color=pb_norm)) +
+#     theme_bw()
+```
+
+Map showing a gage-specific version of the same data:
+
+```{r}
+# single <- temperature_stats %>%
+#   filter(site_1=='01463500'|site_2=='01463500') %>%
+#   mutate(station=ifelse(name_1=="Delaware River at Trenton NJ", name_2, name_1),
+#          site_no=ifelse(name_1=="Delaware River at Trenton NJ", (site_2), (site_1)))
+# 
+# single_gage_network <- nwis %>%
+#   filter(site_no %in% single$site_no) %>%
+#   left_join(single, by="site_no")
+# 
+# mapview(filter(nwis, site_no=="01463500"), col.region="black", cex=8, layer.name="Gage of Interest", alpha.region=1) + mapview(single_gage_network, zcol='NSE_pos', na.rm=T, layer.name="Related Gages (Temperature)")
+# 
+# mapview(filter(nwis, site_no=="01463500"), col.region="black", cex=8, layer.name="Gage of Interest", alpha.region=1) + mapview(single_gage_network, zcol='NSE_norm_pos', na.rm=T, layer.name="Related Gages (Normalized Temperature)")
+```
+
+## LANDSCAPE CHARACTERISTICS FOR EVERY GAGE
+
+Pulling StreamCat data for all USGS gage catchments:
+
+```{r}
+hackastreamcat <- function(name = 'Variable Lists of Interest'){
+  base_url = 'https://gaftp.epa.gov/epadatacommons/ORD/NHDPlusLandscapeAttributes/StreamCat/HydroRegions/'
+  ## Manual because they split up the huc2s.
+  regions = str_pad(2, 2, pad = '0') %>% #only need DRB for this project
+  sort(.)
+  urls = paste0(base_url,name,'_Region',regions,'.zip')
+  folder = paste0('data/temp/',name)
+  files = paste0(folder,'/',regions,'.zip')
+
+  csvs = paste0(folder,'/',name,'_Region',regions,'.csv')
+
+  if(!file.exists(folder)){
+    dir.create(folder)}
+
+  for(i in 1:length(urls)){
+    if(!file.exists(csvs[i])){
+      download.file(url = urls[i],
+                    destfile = files[i])
+      unzip(zipfile = files[i], exdir = folder)}}}
+
+name  = c("BFI","CanalDensity","Dams","Elevation","ImperviousSurfaces","NLCD2016","PRISM_1981_2010","STATSGO_Set1","STATSGO_Set2")
+
+# Reminder this approach is stupidly wasteful. I am very excited for the API.
+# Also reminder, Can pull every category as a riparian buffer dataset.
+
+walk(name, hackastreamcat)
+```
+
+Link StreamCat data to the DRB gages.
+
+```{r}
+kitten_folders <- list.files('data/temp', full.names = T)
+simple_folders <- list.files('data/temp', full.names = F)
+
+stream_kittens <- function(cat_file){
+  temp_list <- list()
+  for(i in 1:length(cat_file[[1]])){
+    scat <- data.table::fread(cat_file[[1]][i])
+    keep_cat <- scat[COMID %in% nwis$comid,]
+    temp_list[[i]] <- keep_cat
+  }
+  out <- do.call('rbind', temp_list)
+  return(out)
+}
+
+#Link all this data to each gage
+
+stream_kitten <- function(cat_file){
+    catcher <- function(file_name){
+      data.table::fread(file_name) %>%
+        .[COMID %in% nwis$comid,]
+    }
+    
+    scat <- map_dfr(cat_file, catcher)
+}
+
+# This is impressively fast. It reads over 2.65 million records 20 times!
+# All in 16 seconds!
+warren <- tibble(kitten_folders, simple_folders) %>%
+  mutate(cat_files = map(kitten_folders, list.files, full.names = T, 
+                     pattern = '.csv'),
+         overlaps = map(cat_files,stream_kitten))
+
+# Glorious reduce function to join all variables together
+nwis_streamcat <- reduce(warren$overlaps, inner_join, by = 'COMID') %>%
+  select(-starts_with(c('WsPctFull.','CatPctFull.','CatAreaSqKm.','WsAreaSqKm.'))) %>%
+  select(-ends_with('Cat')) %>%
+  select(-contains(c("PctFull","Ice"),ignore.case=F)) %>%
+  rename(comid = COMID)
+
+nhd_vars <- nhd %>%
+  select(comid, streamorde, totdasqkm)
+```
+
+## RANDOM FOREST MODELS: DISCHARGE
+
+Next, I have selected three sub-watersheds within the DRB. For each of these watersheds, I am running a random forest model to identify the top variables that predict how similar or dissimilar flows (and/or temperature) are between the watershed outlet and other gages in the network.
+
+```{r}
+schuylkill <- flow_stats %>%
+  filter(site_1=='01474500'|site_2=='01474500') %>%
+  mutate(station=ifelse(name_1=="Schuylkill River at Philadelphia, PA", name_2, name_1),
+         site_no=ifelse(name_1=="Schuylkill River at Philadelphia, PA", site_2, site_1))
+
+schuylkill_network <- nwis %>%
+  filter(site_no %in% schuylkill$site_no) %>%
+  left_join(schuylkill, by="site_no") %>%
+  select(site_no, comid, station_nm, NSE_mm_day, network_distance_km,distance_km) %>%
+  left_join(nwis_streamcat,by="comid") %>%
+  left_join(nhd_vars, by="comid") %>%
+  filter(totdasqkm <= 4888.846) #to remove downstream sites from analysis
+
+brandywine <- flow_stats %>%
+  filter(site_1=='01481500'|site_2=='01481500') %>%
+  mutate(station=ifelse(name_1=="BRANDYWINE CREEK AT WILMINGTON, DE", name_2, name_1),
+         site_no=ifelse(name_1=="BRANDYWINE CREEK AT WILMINGTON, DE", site_2, site_1))
+
+brandywine_network <- nwis %>%
+  filter(site_no %in% brandywine$site_no) %>%
+  left_join(brandywine, by="site_no") %>%
+  select(site_no, comid, station_nm, NSE_mm_day, network_distance_km,distance_km) %>%
+  left_join(nwis_streamcat,by="comid") %>%
+  select(-CanalDensWs) %>%
+  left_join(nhd_vars, by="comid") %>%
+  filter(totdasqkm <= 3526.734) #to remove downstream sites from analysis
+
+lehigh <- flow_stats %>%
+  filter(site_1=='01454700'|site_2=='01454700') %>%
+  mutate(station=ifelse(name_1=="Lehigh River at Glendon, PA", name_2, name_1),
+         site_no=ifelse(name_1=="Lehigh River at Glendon, PA", site_2, site_1))
+
+lehigh_network <- nwis %>%
+  filter(site_no %in% lehigh$site_no) %>%
+  left_join(lehigh, by="site_no") %>%
+  select(site_no, comid, station_nm, NSE_mm_day, network_distance_km,distance_km) %>%
+  left_join(nwis_streamcat,by="comid") %>%
+  left_join(nhd_vars, by="comid") %>%
+  filter(totdasqkm <= 3526.734) #to remove downstream sites from analysis
+
+upde <- flow_stats %>%
+  filter(site_1=='01438500'|site_2=='01438500') %>%
+  mutate(station=ifelse(name_1=="Delaware River at Montague NJ", name_2, name_1),
+         site_no=ifelse(name_1=="Delaware River at Montague NJ", site_2, site_1))
+
+upde_network <- nwis %>%
+  filter(site_no %in% upde$site_no) %>%
+  left_join(upde, by="site_no") %>%
+  select(site_no, comid, station_nm, NSE_mm_day, network_distance_km, distance_km) %>%
+  left_join(nwis_streamcat,by="comid") %>%
+  left_join(nhd_vars, by="comid") %>%
+  filter(totdasqkm <= 9013.8951) #to remove downstream sites from analysis
+
+ schuylkill <- get_nldi_basin(nldi_feature = list(featureSource="nwissite", featureID="USGS-01474500"))
+ lehigh <- get_nldi_basin(nldi_feature = list(featureSource="nwissite", featureID="USGS-01454700"))
+ 
+ flowline1 <- flowlines %>%
+   .[schuylkill,]
+ 
+ flowline2 <- flowlines %>%
+   .[lehigh,] 
+   
+  
+  #mapview(sites_w_discharge, col.region="grey", alpha.region=.50, layer.name="All Gages") + 
+mapview(filter(nwis, site_no=="01474500"), col.region="red",alpha.region=10, layer.name="Schuylkill Ws") + 
+  mapview(schuylkill_network, col.region="red", legend=F,alpha.region=1) + 
+  #mapview(filter(nwis, site_no=="01438500"), col.region="blue", cex=10,alpha.region=10,layer.name="Upper Delaware") + 
+  #mapview(upde_network, col.region="blue", legend=F,alpha.region=1) +
+  mapview(filter(nwis, site_no=="01454700"), col.region="orange", cex=10, alpha.region=10,layer.name="Lehigh Ws") + 
+  mapview(lehigh_network, col.region="orange",legend=F,alpha.region=1) +
+  mapview(flowline1,legend=F,color="grey") + mapview(flowline2,legend=F,color="grey") +
+  mapview(schuylkill, alpha.region=0, alpha=1, legend=F, col.region="snow") +
+  mapview(lehigh, alpha.regions=0, alpha=1, cex=5, legend=F,col.region="snow")
+
+```
+
+### BRANDYWINE CREEK AT WILMINGTON, DE
+
+```{r}
+network <- brandywine_network %>% st_drop_geometry()
+
+corr_matrix <- cor(dplyr::select(network, -c(site_no,comid,station_nm,NSE_mm_day)), use = 'pairwise.complete.obs')
+
+highly_corr_list <- caret::findCorrelation(corr_matrix, cutoff = 0.85, verbose = FALSE, names = TRUE, exact=TRUE) %>%
+    sort()
+  
+vars_reduced <- dplyr::select(network, -c(highly_corr_list), distance_km, network_distance_km)
+rf_datas <- remove_missing(vars_reduced[4:ncol(vars_reduced)])
+
+set.seed(13)
+model<-randomForest(NSE_mm_day ~ ., data = rf_datas, ntree = 50, mtry = 2, nodesize = 5, localImp = TRUE, na.action = na.exclude)
+varImpPlot(model)
+```
+
+### Schuylkill River at Philadelphia, PA
+
+```{r}
+network <- schuylkill_network %>% st_drop_geometry()
+
+corr_matrix <- cor(dplyr::select(network, -c(site_no,comid,station_nm,NSE_mm_day)), use = 'pairwise.complete.obs')
+
+highly_corr_list <- caret::findCorrelation(corr_matrix, cutoff = 0.85, verbose = FALSE, names = TRUE, exact=TRUE) %>%
+    sort()
+  
+vars_reduced <- dplyr::select(network, -c(highly_corr_list), distance_km, network_distance_km)
+rf_datas <- remove_missing(vars_reduced[4:ncol(vars_reduced)])
+
+set.seed(13)
+model<-randomForest(NSE_mm_day ~ ., data = rf_datas, ntree = 50, mtry = 2, nodesize = 5, localImp = TRUE, na.action = na.exclude)
+varImpPlot(model)
+```
+
+Mean Decrease Accuracy (%IncMSE) - This shows how much our model accuracy decreases if we leave out that variable.
+
+Mean Decrease Gini (IncNodePurity) - This is a measure of variable importance based on the Gini impurity index used for the calculating the splits in trees. The higher the value of mean decrease accuracy or mean decrease gini score, the higher the importance of the variable to our model.
+
+### Lehigh River at Glendon, PA
+
+```{r}
+network <- lehigh_network %>% st_drop_geometry() %>%
+  select(-CanalDensWs)
+
+corr_matrix <- cor(dplyr::select(network, -c(site_no,comid,station_nm,NSE_mm_day)), use = 'pairwise.complete.obs')
+
+highly_corr_list <- caret::findCorrelation(corr_matrix, cutoff = 0.85, verbose = FALSE, names = TRUE, exact=TRUE) %>%
+    sort()
+  
+vars_reduced <- dplyr::select(network, -c(highly_corr_list), distance_km, network_distance_km)
+rf_datas <- remove_missing(vars_reduced[4:ncol(vars_reduced)])
+
+set.seed(13)
+model<-randomForest(NSE_mm_day ~ ., data = rf_datas, ntree = 50, mtry = 2, nodesize = 5, localImp = TRUE, na.action = na.exclude)
+varImpPlot(model)
+```
+
+### DELAWARE R AT MONTAGUE NJ (01428500)
+
+```{r}
+network <- upde_network %>% st_drop_geometry()
+
+corr_matrix <- cor(dplyr::select(network, -c(site_no,comid,station_nm,NSE_mm_day)), use = 'pairwise.complete.obs')
+
+highly_corr_list <- caret::findCorrelation(corr_matrix, cutoff = 0.85, verbose = FALSE, names = TRUE, exact=TRUE) %>%
+    sort()
+  
+vars_reduced <- dplyr::select(network, -c(highly_corr_list), distance_km, network_distance_km)
+rf_datas <- remove_missing(vars_reduced[4:ncol(vars_reduced)])
+
+set.seed(13)
+model<-randomForest(NSE_mm_day ~ ., data = rf_datas, ntree = 50, mtry = 2, nodesize = 5, localImp = TRUE, na.action = na.exclude)
+varImpPlot(model)
+```
