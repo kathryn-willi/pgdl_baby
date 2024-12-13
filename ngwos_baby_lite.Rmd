@@ -1,0 +1,421 @@
+---
+title: "ngwos_baby_lite"
+author: "Katie Willi"
+date: "2024-12-13"
+output: html_document
+---
+
+# NGWOS Data Grabbing
+
+```{r}
+library(nhdplusTools)
+library(dataRetrieval)
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(mapview)
+library(plotly)
+library(randomForest)
+library(ggpubr)
+library(data.table)
+mapviewOptions(basemaps.color.shuffle=FALSE, 
+               basemaps=c('CartoDB.Positron', 'CartoDB.DarkMatter', 'OpenStreetMap', 'Esri.WorldImagery', 'OpenTopoMap'))
+```
+
+## GETTING GEOSPATIAL DATA
+
+Finding the HUCs of interest for NGWOS hub:
+
+```{r}
+sf_use_s2(FALSE)
+
+# # USGS-made shapefile of all NGWOS basins:
+#  basins <- st_read("data/iws_basins_5.shp")
+# 
+# # Illinois River Basin:
+hub <- "IL"
+huc <- get_huc(id = c("0713", "0712"), t_srs = 4326, type = "huc04")
+# 
+# # Upper Colorado River Basin:
+# hub <- "UCRB"
+# huc <- get_huc(id = c("1401", "1402", "1403", "1404", "1405", "1406", "1407", "1408"), t_srs = 4326, type = "huc04")
+
+# # Delaware River Basin:
+# hub <- "DRB"
+# huc <- get_huc(id = c("020401", "020402"), t_srs = 4326, type = "huc06")
+
+mapview(huc) #... looks right!
+```
+
+Grabbing NHD data and USGS stream gages within the NGWOS hub:
+
+```{r}
+nwis <- vector("list", length = nrow(huc))
+
+for(i in 1:nrow(huc)){
+  #get all NWIS (current) sites in the NGWOS hub
+  nwis[[i]] <- get_nwis(AOI = huc[i,]) %>%
+    st_transform(4326) %>%
+    .[huc,] %>%
+    mutate(site_pretty = paste0("USGS-",site_no))
+}
+
+nwis <- nwis %>% bind_rows() %>% distinct()
+
+# huc <- huc %>% summarize()
+# 
+# #get all NHD flowlines in the NGWOS hub, and prep for traversing
+# flowlines <- get_nhdplus(AOI = huc, realization = "flowline", t_srs = 4326) %>%
+#   get_tocomid(., add = TRUE) # %>%
+# # mutate(ID = comid, toID = tocomid) #for later... get_pathlength() oddly uses a different naming convention than what's provided
+# 
+# catchments <- get_nhdplus(AOI = huc, realization = "catchment", t_srs = 4326)
+# 
+# mapview(catchments) +
+#   mapview(flowlines) +
+#   mapview(nwis) #... looks right!
+```
+
+Link stream gages to their associated NHD features (flowlines, catchments) using their `comid`:
+
+```{r}
+#linking nwis to nhdplus
+nwis_list <- nwis$site_pretty
+
+nwis$comid <- NA #attempt 'get_nldi_feature()' first
+nwis$comid_coords <- NA #if that doesn't work for all gages (not sure why this is happening?), do 'discover_nhdplus_id()'
+
+#first try to get comid using nldi (verified correct comid)
+for(i in 1:length(nwis_list)){
+  try(nwis$comid[i] <- get_nldi_feature(list("featureSource" = "nwissite", featureID = nwis_list[i]))$comid, silent = T)
+}
+
+#ones it didn't work for. Perhaps these are new gages?
+weirdos <- nwis %>% filter(is.na(comid))
+
+#get the comid using the weirdos' coordinates instead of their gage name
+for(i in 1:nrow(nwis)){
+  try(nwis$comid_coords[i] <- discover_nhdplus_id(nwis[i,]))
+}
+
+nwis <- nwis %>%
+  mutate(comid=ifelse(is.na(comid), comid_coords, comid)) %>%
+  select(site_no, station_nm, comid) %>%
+  mutate(comid = as.numeric(comid)) # %>%
+  # bind_rows(filter(readRDS("~/Desktop/0_my_git/pgdl_baby/data/archive/drb_gages.rds"), !site_no %in% nwis$site_no)) %>%
+  # select(site_no, station_nm, comid) %>%
+  # distinct(.keep_all = TRUE)
+
+#st_write(paste0('data/', hub, '/nwis_gages_comid.shp'), delete_layer = TRUE)
+
+#get all NHD info for each flowline
+flowlines <- get_nhdplus(comid = nwis$comid, realization = "flowline", t_srs = 4326)
+
+hub_nhd_info <- nwis %>%
+  st_drop_geometry() %>%
+  left_join(., flowlines, by = "comid") 
+
+saveRDS(hub_nhd_info, paste0("data/", hub, "_nhd.RDS"))
+```
+
+
+## DOWLOADING FLOW  DATA
+
+What data is available at these gages? Data can be pulled from NWIS as daily (dv), continuous (uv), and as instantaneous (usually saved for water quality samples, qw). We want to ensure that we are collecting all the data that we can, so we are pulling data across all three methods while also minimizing the chance for redundant data.
+
+```{r}
+tables <- rvest::read_html('https://help.waterdata.usgs.gov/parameter_cd?group_cd=%') %>%
+  rvest::html_nodes('table') %>%
+  rvest::html_table()
+
+pcodes <- tables[[1]] %>%
+  janitor::clean_names() %>%
+  dplyr::mutate(parm_cd=stringr::str_pad(as.character(parameter_code),5,pad="0"))
+
+inventory <- whatNWISdata(siteNumber = nwis$site_no) %>%
+  dplyr::left_join(pcodes, by = "parm_cd") %>%
+  dplyr::filter(grepl("discharge|flow",
+                      parameter_name_description, ignore.case = T),
+                # for a sediment-related parameter that still passed through
+                !grepl('sediment', parameter_name_description, ignore.case = T)) %>%
+  mutate(combo=paste0(site_no, "-", parm_cd))
+
+# DAILY
+
+daily <- inventory %>%
+  filter(data_type_cd == "dv")
+
+list <- unique(daily$combo)
+
+nwis_puller <- function(list){
+  
+  ind <- filter(daily, combo==list)
+  
+  readNWISdv(unique(ind$site_no), unique(ind$parm_cd),
+             startDate = "2009-10-01", endDate = "2024-09-30") %>%
+    mutate(across(everything(), as.character)) %>%
+    write_csv(paste0('data/', hub, '/nwis/dv/',unique(ind$site_no),'_',unique(ind$parm_cd),'.csv'))
+}
+
+map(list,
+    possibly(nwis_puller, otherwise = 1 + 1))
+
+nwis_dv <- map_dfr(list.files(path = paste0("data/", hub, "/nwis/dv/"),
+                              pattern = "*.csv",
+                              full.names = TRUE),
+                   ~read_csv(.) %>% mutate(across(everything(), as.character)))
+
+# CONTINUOUS
+
+# uv <- inventory %>%
+#   filter(data_type_cd == "uv") %>%
+#   # remove sites that already have daily data available for the given
+#   # parameter, site, and date range
+#   filter(!combo %in% daily$combo) %>%
+#   distinct(combo, .keep_all = TRUE)
+# 
+# list <- unique(uv$combo)
+# 
+# nwis_puller <- function(list){
+# 
+#   ind <- filter(uv, combo == list)
+# 
+#   readNWISuv(unique(ind$site_no), unique(ind$parm_cd),
+#              startDate = "2009-10-01", endDate = "2024-09-30") %>%
+#     mutate(across(everything(), as.character)) %>%
+#     write_csv(paste0('data/', hub, '/nwis/uv/', unique(ind$site_no),'_', unique(ind$parm_cd), '.csv'))
+# }
+# 
+# map(list,
+#     possibly(nwis_puller, otherwise = 1+1))
+# 
+# nwis_uv <- map_dfr(list.files(path = paste0("data/", hub, "/nwis/uv/"),
+#                               pattern = "*.csv",
+#                               full.names = TRUE),
+#                    ~fread(.) %>% mutate(across(everything(), as.character)))
+# 
+# # for data that is stored as water quality data... very rare for continuous data
+# qw <- inventory %>%
+#   filter(data_type_cd=="qw") %>%
+#   filter(!combo %in% daily$combo) %>%
+#   filter(!combo %in% uv$combo) %>%
+#   distinct(combo,.keep_all=TRUE)
+# 
+# list <- unique(qw$combo)
+# 
+# nwis_puller <- function(list){
+#   
+#   ind <- filter(qw, combo==list)
+#   readNWISqw(unique(ind$site_no), unique(ind$parm_cd),
+#              startDate="2010-10-01", endDate="2024-09-30") %>%
+#     mutate(across(everything(), as.character)) %>%
+#     write_csv(paste0('data/', hub, '/nwis/qw/',unique(ind$site_no),'_',unique(ind$parm_cd),'.csv'))
+# }
+# 
+# map(list,
+#     possibly(nwis_puller, otherwise=1+1))
+# 
+# nwis_qw <- map_dfr(list.files(path = paste0("data/", hub, "/nwis/qw/"),
+#                               pattern = "*.csv",
+#                               full.names = TRUE),
+#                    ~fread(.) %>% mutate(across(everything(), as.character)))
+```
+
+Organizing this mess of slightly different parameter names that makes working with the dataset difficult.
+
+```{r}
+# Check if the necessary NGWOS columns exist in the data, and if its DRB use tidal flow data
+if (all(c("X_.NGWOS._00060_00003") %in% colnames(nwis_dv)) & hub == "DRB") {
+  
+  daily <- nwis_dv %>%
+    # Preserve NGWOS data if available
+    mutate(X_00060_00003 = ifelse(!is.na(X_.NGWOS._00060_00003), 
+                                  X_.NGWOS._00060_00003, X_00060_00003)) %>%
+    # mutate(X_00010_00003 = ifelse(!is.na(X_.NGWOS._00010_00003),
+    #                               X_.NGWOS._00010_00003, X_00010_00003)) %>%
+    mutate(NGWOS = ifelse(!is.na(X_.NGWOS._00060_00003),
+                          "NGWOS", NA)) %>%
+    # columns that represent sites with multiple values for a given parameter
+    select(!contains(c("_cd",
+                       "Test.Bed",
+                       "Piezometer",
+                       "EXPERIMENTAL",
+                       "NGWOS"))) %>%
+    pivot_longer(contains("00060_00003"), 
+                 names_to = "DISCHARGE", values_to = "CFS") %>%
+    pivot_longer(contains("72137_00003"), 
+                   names_to = "TIDAL_DISCHARGE", values_to = "TIDAL_CFS") %>%
+    # pivot_longer(contains("00010_00003"), 
+    #              names_to = "TEMP", values_to ="CELSIUS") %>%
+    # if there is no data in any of these columns, remove... essentially, 
+    # removing those instances where there was no "normal" data, only
+    # "experimental" data
+    filter(!is.na(CFS) | !is.na(TIDAL_CFS))# | !is.na(CELSIUS))
+  
+} else {
+  message("No NGWOS columns exist in the nwis_dv object.")
+  
+  daily <- nwis_dv %>%
+    # columns that represent sites with multiple values for a given parameter
+    select(!contains(c("_cd",
+                       "Test.Bed",
+                       "Piezometer",
+                       "EXPERIMENTAL",
+                       "NGWOS"))) %>%
+    pivot_longer(("X_00060_00003"), 
+                 names_to = "DISCHARGE", values_to = "CFS") %>%
+    # pivot_longer(contains("00010_00003"), 
+    #              names_to = "TEMP", values_to ="CELSIUS") %>%
+    filter(!is.na(CFS))# | !is.na(CELSIUS))
+}
+
+# Any data loss after this manipulation?
+n_distinct(daily$site_no) == n_distinct(nwis_dv$site_no) #...Yes but because lots of rows were empty fo CO.
+
+# continuous <- nwis_uv %>%
+#   mutate(dateTime = as_datetime(dateTime, tz = "UTC")) %>%
+#   mutate(DT = with_tz(dateTime, tzone = "EST"),
+#          Date = as_date(DT)) %>%
+#   group_by(site_no, Date) %>%
+#   summarize(#CELSIUS = mean(as.numeric(X_00010_00000), na.rm = T),
+#             CFS = mean(as.numeric(X_00060_00000), na.rm = T),
+#            # FS = mean(as.numeric(X_72255_00000), na.rm = T),
+#             TIDAL_CFS = mean(as.numeric(X_72137_00000), na.rm = T))  %>%
+#   filter(!is.na(CFS) & !is.na(TIDAL_CFS))# | !is.na(CELSIUS))
+
+# Any data loss after this manipulation?
+# n_distinct(nwis_uv$site_no) == n_distinct(continuous$site_no) #... yes andddd why?
+```
+
+Separating our now-tidied data into flow and temperature:
+
+```{r}
+discharge <- select(daily, site_no, Date, CFS) %>%
+  mutate(Date = ymd(Date)) %>%
+  distinct(.keep_all = TRUE) %>%
+  #rbind(distinct(select(continuous, site_no, Date, CFS), .keep_all = TRUE)) %>%
+  group_by(site_no, Date) %>%
+  summarize(CFS = mean(as.numeric(CFS), na.rm = T)) %>%
+  filter(!is.na(CFS)) %>%
+  filter(as.numeric(CFS) > -999999.000) %>%
+  mutate(type = "Non-Tidal")
+# feather::write_feather(discharge, paste0("data/", hub, "_discharge.feather"))
+
+# test that there are no duplicates (indicating something funky is going on)
+discharge %>% group_by(site_no, Date) %>% 
+  summarize(count = n()) %>% 
+  filter(count > 1) %>% 
+  distinct(site_no, .keep_all = TRUE)
+
+if(hub == "DRB"){
+  
+  try(tidal_discharge <- select(daily, site_no, Date, TIDAL_CFS) %>%
+        mutate(Date = ymd(Date)) %>%
+        distinct(.keep_all = TRUE) %>%
+        # rbind(distinct(select(continuous, site_no, Date, TIDAL_CFS), .keep_all = TRUE)) %>%
+        group_by(site_no, Date) %>%
+        summarize(TIDAL_CFS = mean(as.numeric(TIDAL_CFS), na.rm = T)) %>%
+        filter(!is.na(TIDAL_CFS)) %>%
+    mutate(type = "Tidal"))
+  
+  # test that there are no duplicates (indicating something funky is going on)
+  
+  try(tidal_discharge %>%
+        group_by(site_no, Date) %>% 
+        summarize(count = n()) %>% 
+        filter(count > 1) %>% 
+        distinct(site_no, .keep_all = TRUE))
+
+
+discharge <- bind_rows(discharge, tidal_discharge %>% rename(CFS = TIDAL_CFS))
+
+}
+
+feather::write_feather(discharge, paste0("data/", hub, "_discharge.feather"))
+
+```
+
+
+
+## LANDSCAPE CHARACTERISTICS FOR EVERY GAGE
+
+Pulling StreamCat data for all USGS gage catchments:
+
+```{r}
+# Grab a list of all available streamcat variables:
+download.file("https://java.epa.gov/StreamCAT/metrics/variable_info.csv",
+              destfile = paste0(getwd(), "/data/StreamCatVars.csv"))
+
+vars <- read_csv("data/StreamCatVars.csv")
+
+fred_vars <- c("CanalDens", 
+               # BFI
+               "BFI", 
+               #NLCD 2019
+               "PctOw2019", "PctIce2019", "PctUrbOp2019", "PctUrbLo2019", "PctUrbMd2019", "PctUrbHi2019",
+               "PctBl2019", "PctDecid2019", "PctConif2019", "PctMxFst2019", "PctShrb2019",  "PctGrs2019", 
+               "PctHay2019", "PctCrop2019",  "PctWdWet2019", "PctHbWet2019", 
+               # Dam Info
+               "DamDens", "DamNIDStor", "DamNrmStor",
+               # Elevation
+               "Elev", 
+               # Impervious Surfaces
+               "PctImp2006", "PctImp2008", "PctImp2011", "PctImp2001",
+               "PctImp2013", "PctImp2019", "PctImp2016", "PctImp2004",
+               # PRISM 1991-2020
+               "Precip9120", "Tmax9120", "Tmean9120", "Tmin9120",
+               # STATSGO 
+               "Clay", "Sand", "WtDep", "Om", "Perm", "RckDep")
+
+nwis_streamcat <- StreamCatTools::sc_get_data(metric = paste(fred_vars, collapse = ","),
+                                              aoi = 'watershed', 
+                                              comid = nwis$comid) %>%
+  # remove variables we don't particularly care about that get returned:
+  select(-contains("AREASQKM")) %>%
+  rename(comid = COMID) %>%
+  left_join(st_drop_geometry(flowlines) %>%
+              select(comid, streamorde, totdasqkm), by = "comid")
+
+for_saving <- nwis %>% select(site_no, comid) %>%
+  left_join(nwis_streamcat, by = "comid")
+
+saveRDS(for_saving, paste0("data/", hub, "_streamcat.RDS"))
+```
+
+Why different?
+```{r}
+OLD_drb_gages <- readRDS("~/Desktop/0_my_git/pgdl_baby/data/archive/drb_gages.rds") %>% select(-geometry.y) %>% as_tibble() %>% rename(geometry = geometry.x) %>% st_as_sf() %>% st_make_valid()
+OLD_nwis_streamcat <- readRDS("~/Desktop/0_my_git/pgdl_baby/data/archive/nwis_streamcat.rds")
+OLD_drb_discharge <- feather::read_feather("~/Desktop/0_my_git/pgdl_baby/data/archive/DRB_discharge.feather")
+NEW_drb_discharge <- feather::read_feather("~/Desktop/0_my_git/pgdl_baby/data/DRB_discharge.feather")
+NEW_drb_gages <- readRDS("~/Desktop/0_my_git/pgdl_baby/data/DRB_nhd.RDS")
+
+filter(NEW_drb_discharge, !site_no %in% NEW_drb_gages$site_no) %>%
+  distinct()
+
+
+missing <- OLD_drb_gages %>% filter(!site_no %in% nwis$site_no)
+
+missing <- OLD_drb_gages %>% filter(!site_no %in% NEW_drb_discharge$site_no) %>%
+  distinct(site_no)
+
+
+new <- nwis %>% filter(!site_no %in% OLD_drb_gages$site_no)
+
+mapview(missing %>% distinct(), color = "blue", alpha.regions = 1, cex = 3, layer.name = "Missing Gages") +
+  #mapview(OLD_drb_gages %>% select(comid), col.regions = "red", alpha.regions = 1, cex = 4, layer.name = "Old gages") +
+  mapview(huc) +
+mapview(nwis, color = "red", cex = 7.5, alpha.regions = 1, layer.name = "Discharge")
+
+inventory_missing <- whatNWISdata(siteNumber = missing$site_no) %>%
+  dplyr::left_join(pcodes, by = "parm_cd") %>%
+  dplyr::filter(grepl("discharge|flow",
+                      parameter_name_description, ignore.case = T),
+                # for a sediment-related parameter that still passed through
+                !grepl('sediment', parameter_name_description, ignore.case = T)) %>%
+  mutate(combo=paste0(site_no, "-", parm_cd)) %>%
+  filter(parm_cd == "00060",
+         year(end_date) >= "2009") %>%
+  distinct(site_no, .keep_all = TRUE)
+```
+
